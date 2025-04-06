@@ -1,0 +1,123 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && 
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+    
+    function isVolunteer() {
+      return isAuthenticated() && 
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'volunteer';
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function hasPermission(permission) {
+      return isAuthenticated() && 
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.permissions.hasAny([permission]);
+    }
+    
+    // Users collection rules
+    match /users/{userId} {
+      // Anyone can create a user document with their own UID
+      allow create: if isAuthenticated() && request.auth.uid == userId &&
+        (
+          // Regular user creation
+          (request.resource.data.role == 'user' &&
+          !request.resource.data.keys().hasAny(['isAdmin', 'isVolunteer'])) ||
+          // Admin creation with proper permissions
+          (request.resource.data.role == 'admin' && 
+           (hasPermission('create_admins') || request.resource.data.adminMetadata.createdBy == 'master_key'))
+        );
+      
+      // Users can read their own data, admins can read all users
+      allow read: if isOwner(userId) || isAdmin();
+      
+      // Users can update their own non-sensitive fields
+      // Admins can update all fields
+      allow update: if (isOwner(userId) && 
+          !request.resource.data.diff(resource.data).affectedKeys()
+            .hasAny(['role', 'isAdmin', 'isVolunteer', 'permissions', 'adminMetadata'])) ||
+        isAdmin();
+          
+      // Only admins can delete user documents
+      allow delete: if isAdmin();
+    }
+    
+    // Complaints collection rules
+    match /complaints/{complaintId} {
+      // Users can create complaints
+      allow create: if isAuthenticated() && 
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.status == 'pending';
+      
+      // Users can read their own complaints
+      // Volunteers can read assigned complaints
+      // Admins can read all
+      allow read: if isAuthenticated() && 
+        (resource.data.userId == request.auth.uid || 
+         isVolunteer() || 
+         isAdmin());
+      
+      // Users can update some fields of their own complaints
+      // Volunteers can update assigned complaints
+      // Admins can update all complaints
+      allow update: if isAuthenticated() && 
+        ((resource.data.userId == request.auth.uid && 
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['description', 'location', 'images', 'category'])) || 
+         (isVolunteer() && resource.data.assignedTo == request.auth.uid) ||
+         isAdmin());
+      
+      // Only admins can delete complaints
+      allow delete: if isAdmin();
+    }
+
+    // Assignments collection (for task assignments)
+    match /assignments/{assignmentId} {
+      // Only admins can create assignments
+      allow create: if isAdmin() && hasPermission('assign_tasks');
+      
+      // Admins and assigned volunteers can read assignments
+      allow read: if isAdmin() || 
+        (isVolunteer() && resource.data.assignedTo == request.auth.uid);
+      
+      // Only admins can update assignments
+      allow update: if isAdmin() && hasPermission('assign_tasks');
+      
+      // Only admins can delete assignments
+      allow delete: if isAdmin() && hasPermission('assign_tasks');
+    }
+    
+    // Stats collection
+    match /stats/{statId} {
+      // Everyone can read stats
+      allow read: if true;
+      
+      // Only admins can write to stats
+      allow write: if isAdmin() && hasPermission('view_analytics');
+    }
+    
+    // Public content
+    match /content/{contentId} {
+      // Everyone can read public content
+      allow read: if true;
+      
+      // Only admins can write to public content
+      allow write: if isAdmin();
+    }
+    
+    // Catch-all rule - deny access by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+} 
